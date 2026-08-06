@@ -52,12 +52,12 @@ export default function Page() {
           <span>
             AI fitting powered by{" "}
             <a
-              href="https://ai.google.dev/gemini-api/docs"
+              href="https://magichour.ai"
               target="_blank"
               rel="noreferrer"
               className="underline underline-offset-2 hover:text-foreground"
             >
-              Google Gemini
+              Magic Hour
             </a>
           </span>
         </div>

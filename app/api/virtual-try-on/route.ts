@@ -1,41 +1,64 @@
+import { ApiError, Client } from "magic-hour"
 import { NextRequest, NextResponse } from "next/server"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
-const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite-image"
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const API_TOKEN = process.env.API_KEY
 
-const TRY_ON_PROMPT =
-  "You are a virtual fitting room. Take the person shown in the first image " +
-  "and the garment shown in the second image, and produce a realistic photo of " +
-  "the person wearing that garment. Keep the person's face, body proportions, " +
-  "pose, background, and lighting exactly the same. Match the garment's style, " +
-  "color, pattern, and fabric to the garment image. Return only the resulting image."
+const client = new Client({ token: API_TOKEN })
 
-type InlineData = { mimeType: string; data: string }
+const GARMENT_TYPE = "upper_body"
 
-function dataUrlToInlineData(dataUrl: string): InlineData {
-  const [meta, data] = dataUrl.split(",")
-  const mimeType = /data:(.+?);base64/.exec(meta)?.[1] ?? "image/jpeg"
-  return { mimeType, data }
+type DecodedImage = {
+  extension: string
+  data: Buffer
 }
 
-function geminiErrorMessage(raw: string, status: number): string {
-  try {
-    const parsed = JSON.parse(raw) as {
-      error?: { message?: string }
+function dataUrlToImage(dataUrl: string): DecodedImage {
+  const [meta, data] = dataUrl.split(",")
+  const mimeType = /data:(.+?);base64/.exec(meta)?.[1] ?? "image/jpeg"
+  const extension =
+    mimeType === "image/png"
+      ? "png"
+      : mimeType === "image/webp"
+        ? "webp"
+        : "jpg"
+  return { extension, data: Buffer.from(data, "base64") }
+}
+
+function mimeForPath(filePath: string): string {
+  return filePath.toLowerCase().endsWith(".png")
+    ? "image/png"
+    : filePath.toLowerCase().endsWith(".webp")
+      ? "image/webp"
+      : "image/jpeg"
+}
+
+async function apiErrorMessage(error: unknown): Promise<string> {
+  if (error instanceof ApiError) {
+    try {
+      const raw = await error.response.clone().text()
+      const parsed = JSON.parse(raw) as { error?: { message?: string } }
+      const message = parsed?.error?.message?.split("\n")[0]?.trim()
+      if (message) {
+        return message
+      }
+    } catch {
+      // The upstream body was not JSON; fall through to the default message.
     }
-    const message = parsed?.error?.message?.split("\n")[0]?.trim()
-    if (message) {
-      return message
-    }
-  } catch {
-    // The upstream body was not JSON; fall back to the generic message.
+
+    return error.message
   }
 
-  return `Gemini returned an error (${status}).`
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  return "Could not reach the Magic Hour API."
 }
 
 export async function POST(request: NextRequest) {
@@ -54,112 +77,76 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  if (!GEMINI_API_KEY) {
+  if (!API_TOKEN) {
     return NextResponse.json(
       {
         error:
-          "The Gemini API key is not configured. Add GEMINI_API_KEY to your .env file.",
+          "The Magic Hour API key is not configured. Add API_KEY to your .env file.",
       },
       { status: 500 }
     )
   }
 
-  const person = dataUrlToInlineData(body.person)
-  const garment = dataUrlToInlineData(body.garment)
+  const person = dataUrlToImage(body.person)
+  const garment = dataUrlToImage(body.garment)
 
-  const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { text: TRY_ON_PROMPT },
-          { inline_data: { mime_type: person.mimeType, data: person.data } },
-          { inline_data: { mime_type: garment.mimeType, data: garment.data } },
-        ],
-      },
-    ],
-    generationConfig: { responseModalities: ["IMAGE"] },
-  }
+  const dir = await mkdtemp(join(tmpdir(), "fittech-"))
+  const personPath = join(dir, `person.${person.extension}`)
+  const garmentPath = join(dir, `garment.${garment.extension}`)
 
   try {
-    const upstream = await fetch(
-      `${GEMINI_API_URL}/models/${GEMINI_MODEL}:generateContent`,
+    await writeFile(personPath, person.data)
+    await writeFile(garmentPath, garment.data)
+
+    const result = await client.v1.aiClothesChanger.generate(
       {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
+        assets: {
+          garmentFilePath: garmentPath,
+          garmentType: GARMENT_TYPE,
+          personFilePath: personPath,
         },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(90_000),
+        name: "FitTech Clothes Changer",
+      },
+      {
+        waitForCompletion: true,
+        downloadOutputs: true,
+        downloadDirectory: dir,
       }
     )
 
-    const raw = await upstream.text()
-
-    if (!upstream.ok) {
-      return NextResponse.json(
-        {
-          error: geminiErrorMessage(raw, upstream.status),
-          detail: raw.slice(0, 500),
-        },
-        { status: upstream.status === 429 ? 429 : 502 }
-      )
+    if (result.status !== "complete") {
+      const detail = result.error
+        ? `${result.error.message}`
+        : `The generation ended with status "${result.status}".`
+      return NextResponse.json({ error: detail }, { status: 502 })
     }
 
-    let json: {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{ inlineData?: { mimeType?: string; data?: string } }>
-        }
-      }>
-      promptFeedback?: { blockReason?: string }
-    }
+    const outputPath = result.downloadedPaths?.[0]
 
-    try {
-      json = JSON.parse(raw)
-    } catch {
+    if (!outputPath) {
       return NextResponse.json(
-        {
-          error: "Gemini returned an unexpected response.",
-          detail: raw.slice(0, 500),
-        },
+        { error: "The fitting service did not return an image." },
         { status: 502 }
       )
     }
 
-    const part = json?.candidates?.[0]?.content?.parts?.find(
-      (candidatePart) => candidatePart.inlineData?.data
-    )
-
-    if (!part?.inlineData?.data) {
-      const blockReason = json?.promptFeedback?.blockReason
-      return NextResponse.json(
-        {
-          error: blockReason
-            ? `The request was blocked by Gemini (${blockReason}).`
-            : "Gemini did not return an image.",
-        },
-        { status: 502 }
-      )
-    }
-
-    const mimeType = part.inlineData.mimeType ?? "image/png"
+    const output = await readFile(outputPath)
+    const mimeType = mimeForPath(outputPath)
     const format = mimeType === "image/png" ? "png" : "jpg"
 
     return NextResponse.json({
-      image: `data:${mimeType};base64,${part.inlineData.data}`,
+      image: `data:${mimeType};base64,${output.toString("base64")}`,
       format,
     })
   } catch (error) {
     return NextResponse.json(
+      { error: await apiErrorMessage(error) },
       {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Could not reach the Gemini API.",
-      },
-      { status: 500 }
+        status:
+          error instanceof ApiError && error.response.status === 401 ? 401 : 502,
+      }
     )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 }
